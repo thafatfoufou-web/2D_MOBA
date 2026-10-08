@@ -1,0 +1,9 @@
+# build output
+out/
+*.zip
+*.ps1
+logs/
+versionfinalinshallah2/
+.DS_Store
+Thumbs.db
+/bin/

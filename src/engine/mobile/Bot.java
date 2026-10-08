@@ -1,0 +1,215 @@
+package engine.mobile;
+
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.log4j.Logger;
+
+import data.model.Hero;
+import game_config.GameConfiguration;
+import log.LoggerUtility;
+
+public class Bot extends Personnage {
+
+    private static final Logger logger = LoggerUtility.getLogger(Bot.class);
+
+    private String heroName;
+    private String name;
+    private boolean retreating = false;
+    private double retreatSafeRadius = GameConfiguration.RETREAT_SAFE_RADIUS;
+    private double retreatTresHold = GameConfiguration.RETREAT_HP_THRESHOLD;
+    private int waypointIndex = 0;
+    private List<double[]> waypoints;
+
+
+    private boolean waitingAtBase = false;
+
+    public Bot(List<double[]> waypoints, int team, String name, Hero hero) {
+        super(
+            (team == 0) ? GameConfiguration.START_X : GameConfiguration.START_Y,
+            (team == 0) ? GameConfiguration.START_Y : GameConfiguration.START_X,
+            team,
+            hero
+        );
+        this.waypoints = waypoints;
+        this.name      = name;
+        this.heroName  = hero.getName();
+        logger.debug("Bot created: " + name + " using hero " + heroName + " for team " + team);
+    }
+
+
+    @Override
+    protected void onRespawn() {
+        super.onRespawn();
+        waypointIndex = 0;
+        retreating = false;
+        waitingAtBase = false;
+    }
+
+    private boolean followWaypoints(double deltaTime, List<Bot> allBots) {
+
+        if (waypointIndex >= waypoints.size()) return false;
+        double[] wp = waypoints.get(waypointIndex);
+
+        double dx = wp[0] - x;
+        double dy = wp[1] - y;
+
+        // update direction
+        currentDirection = Direction.fromDelta((int) dx, (int) dy, currentDirection);
+
+        // check for other bots to avoid collision
+        for (Bot other : allBots) {
+            if (other == this || !other.isActive()) continue;
+            double odx = other.getX() - wp[0];
+            double ody = other.getY() - wp[1];
+            if (Math.sqrt(odx*odx + ody*ody) < GameConfiguration.TILE_SIZE * 0.6) return false; // occupied, wait
+        }
+
+        double dist = Math.sqrt(dx*dx + dy*dy);
+
+        if (dist < 8.0) {
+            waypointIndex++;
+            return false;
+        } else {
+            x += (dx / dist) * speed * deltaTime;
+            y += (dy / dist) * speed * deltaTime;
+            return true;
+        }
+    }
+
+    private void followWaypointsReverse(double deltaTime, List<Bot> allBots) {
+        if (waypointIndex <= 0) {
+            moveToPoint((team == 0) ? GameConfiguration.START_X : GameConfiguration.START_Y,
+                        (team == 0) ? GameConfiguration.START_Y : GameConfiguration.START_X, deltaTime);
+            return;
+        }
+
+        double[] wp = waypoints.get(waypointIndex - 1);
+        double dx = wp[0] - x;
+        double dy = wp[1] - y;
+        double dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < 8.0) {
+            waypointIndex--;
+        } else {
+            x += (dx / dist) * speed * deltaTime;
+            y += (dy / dist) * speed * deltaTime;
+            currentDirection = Direction.fromDelta((int) dx, (int) dy, currentDirection);
+            currentState = State.MOVING;
+        }
+    }
+
+    public int getHeroId() { return hero.getId(); }
+
+    public String getHeroName() { return heroName; }
+
+    public String getName() { return this.name; }
+
+    public double getRespawnTimer() { return respawnTimer; }
+
+    private void handleRetreat(double deltaTime, List<Entity> enemies, List<Bot> allBots) {
+
+        double fX = (team == 0) ? GameConfiguration.START_X : GameConfiguration.START_Y;
+        double fY = (team == 0) ? GameConfiguration.START_Y : GameConfiguration.START_X;
+
+        double distToFountain = Math.sqrt(Math.pow(fX - x, 2) + Math.pow(fY - y, 2));
+        Entity closestEnemy = EntityUtils.findClosest(this, enemies);
+        double distToEnemy = (closestEnemy != null) ? getDistanceTo(closestEnemy) : Double.MAX_VALUE;
+
+        // Close to fountain: walk to it and mark that we are waiting to heal 
+        if (distToFountain <= retreatSafeRadius) {
+            interruptRecall();
+            moveToPoint(fX, fY, deltaTime);
+            waitingAtBase = true;
+        }
+        // No enemies nearby: recall
+        else if (distToEnemy > retreatSafeRadius) {
+            if (!isRecalling()) { startRecall(); }
+        }
+        // Enemies around: walk back along waypoints
+        else {
+            interruptRecall();
+            followWaypointsReverse(deltaTime, allBots);
+        }
+    }
+
+    public void move(double deltaTime, List<Entity> enemies, List<Bot> allBots, ArrayList<Personnage> allPersonnages) {
+        double hpPercent = hp / maxHp;
+
+       // stay idle until fully healed
+        if (waitingAtBase) {
+            if (hpPercent < 1.0) {
+                currentState = State.IDLE;
+                updateAnimation(deltaTime);
+                return;
+            } else {
+                waitingAtBase = false;
+                retreating = false;
+                waypointIndex = 0;
+            }
+        }
+
+        retreating = hpPercent < retreatTresHold;
+
+        if (retreating) {
+            handleRetreat(deltaTime, enemies, allBots);
+        } else {
+            Entity target = EntityUtils.findClosest(this, enemies);
+            if (target != null && getDistanceTo(target) <= atkRange) {
+                logger.debug("Bot " + name + " attacking target at distance " + getDistanceTo(target));
+                attack(target, deltaTime, allPersonnages);
+            } else {
+                boolean moved = followWaypoints(deltaTime, allBots);
+
+                if (moved) {
+                    currentState = State.MOVING;
+                } else if (currentState != State.ATTACKING) {
+                    currentState = State.IDLE;
+                }
+            }
+        }
+        updateAnimation(deltaTime);
+    }
+
+    private void moveToPoint(double targetX, double targetY, double deltaTime) {
+        double dx = targetX - x;
+        double dy = targetY - y;
+        double dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > 5.0) {
+            x += (dx / dist) * speed * deltaTime;
+            y += (dy / dist) * speed * deltaTime;
+            currentDirection = Direction.fromDelta((int) dx, (int) dy, currentDirection);
+            currentState = State.MOVING;
+        } else {
+            currentState = State.IDLE;
+        }
+    }
+
+    @Override
+    public void render(Graphics2D g2, int width, int height) {
+        if (!active) return;
+        renderSprite(g2);
+        if (isRecalling()) {
+            int r =  250;
+            g2.setColor(new Color(0, 100, 255, 40));
+            g2.fillOval((int)x - r, (int)y - (int)(r/1.5), r * 2, r * 2);
+            g2.setColor(new Color(0, 100, 255, 120));
+            g2.drawOval((int)x - r, (int)y - (int)(r/1.5), r * 2, r * 2);
+        }
+    }
+
+    public void update(double deltaTime, List<Entity> enemies, List<Bot> allBots, ArrayList<Personnage> allPersonnages) {
+        if (hp <= 0 && active) { die(); }
+        if (!active) { super.respawn(deltaTime); return; }
+        updateTimers(deltaTime);
+
+        addPassiveGold(game_config.GameConfiguration.PASSIVE_GOLD_PER_SECOND, deltaTime);
+
+        if (isStunned()) { currentState = State.IDLE; updateAnimation(deltaTime); return; }
+        logger.debug("Bot " + name + " updating - HP: " + hp + "/" + maxHp + ", state: " + currentState);
+        move(deltaTime, enemies, allBots, allPersonnages);
+        updateRecall(deltaTime);
+    }
+}
